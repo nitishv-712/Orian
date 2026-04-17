@@ -16,7 +16,6 @@ class AppPermissions {
     }
 
     // 3. Foreground service / battery optimization
-    // Ask user to ignore battery optimization so background service isn't killed
     final ignoreBattery = await FlutterForegroundTask.isIgnoringBatteryOptimizations;
     if (!ignoreBattery) {
       await FlutterForegroundTask.requestIgnoreBatteryOptimization();
@@ -30,13 +29,21 @@ class AppPermissions {
       }
     }
 
-    // Critical: notification must be granted for foreground service to show
     if (notification.isPermanentlyDenied && context.mounted) {
       _showSettingsDialog(context);
       return false;
     }
 
     return notification.isGranted || notification.isLimited;
+  }
+
+  static Future<bool> requestRecordAudio(BuildContext context) async {
+    final status = await Permission.microphone.request();
+    if (status.isPermanentlyDenied && context.mounted) {
+      _showSettingsDialog(context);
+      return false;
+    }
+    return status.isGranted;
   }
 
   static void _showSettingsDialog(BuildContext context) {

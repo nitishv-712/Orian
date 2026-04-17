@@ -2,6 +2,7 @@
     <!-- Audio & background -->
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE"/>
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MEDIA_PLAYBACK"/>
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MEDIA_PROJECTION"/>
     <uses-permission android:name="android.permission.WAKE_LOCK"/>
     <uses-permission android:name="android.permission.RECEIVE_BOOT_COMPLETED"/>
 
@@ -12,8 +13,9 @@
     <uses-permission android:name="android.permission.BLUETOOTH" android:maxSdkVersion="30"/>
     <uses-permission android:name="android.permission.BLUETOOTH_CONNECT"/>
 
-    <!-- Audio routing -->
+    <!-- Audio routing & capture -->
     <uses-permission android:name="android.permission.MODIFY_AUDIO_SETTINGS"/>
+    <uses-permission android:name="android.permission.RECORD_AUDIO"/>
 
     <application
         android:label="orian"
@@ -37,12 +39,18 @@
             </intent-filter>
         </activity>
 
+        <!-- flutter_foreground_task service -->
         <service
             android:name="com.pravera.flutter_foreground_task.service.ForegroundTaskService"
             android:foregroundServiceType="mediaPlayback"
             android:exported="false"/>
 
-        <!-- Restart service on boot -->
+        <!-- System audio capture service -->
+        <service
+            android:name=".AudioCaptureService"
+            android:foregroundServiceType="mediaProjection"
+            android:exported="false"/>
+
         <receiver
             android:name="com.pravera.flutter_foreground_task.receiver.BootReceiver"
             android:exported="false">
