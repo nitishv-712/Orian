@@ -36,6 +36,9 @@ dependencies:
   cupertino_icons: ^1.0.8
   firebase_core: ^4.6.0
   firebase_auth: ^6.3.0
+  just_audio: ^0.9.46
+  audio_session: ^0.1.21
+  flutter_foreground_task: ^8.16.0
 
 dev_dependencies:
   flutter_test:
