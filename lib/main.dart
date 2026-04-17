@@ -2,6 +2,7 @@ import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:flutter_foreground_task/flutter_foreground_task.dart';
 import 'audio_task.dart';
+import 'app_permissions.dart';
 
 void main() {
   WidgetsFlutterBinding.ensureInitialized();
@@ -50,24 +51,53 @@ class AudioControlPage extends StatefulWidget {
 
 class _AudioControlPageState extends State<AudioControlPage> {
   bool _isRunning = false;
+  bool _permissionsGranted = false;
   double _volume = 1.0;
   final _urlController = TextEditingController(
     text: 'https://www.soundhelix.com/examples/mp3/SoundHelix-Song-1.mp3',
   );
 
+  @override
+  void initState() {
+    super.initState();
+    _checkInitialState();
+  }
+
+  Future<void> _checkInitialState() async {
+    // Check if service already running (app restarted)
+    final running = await FlutterForegroundTask.isRunningService;
+    // Check notification permission status without requesting
+    final notifStatus = await FlutterForegroundTask.checkNotificationPermission();
+    if (mounted) {
+      setState(() {
+        _isRunning = running;
+        _permissionsGranted = notifStatus == NotificationPermission.granted;
+      });
+    }
+  }
+
+  Future<void> _requestPermissionsAndStart() async {
+    final granted = await AppPermissions.requestAll(context);
+    if (!mounted) return;
+    setState(() => _permissionsGranted = granted);
+    if (granted) await _startService();
+  }
+
   Future<void> _startService() async {
     final result = await FlutterForegroundTask.startService(
       serviceId: 1,
       notificationTitle: 'Orian Audio',
-      notificationText: 'Playing audio...',
+      notificationText: 'Service running — tap Play to start audio',
       callback: startCallback,
     );
-    if (result is ServiceRequestSuccess) setState(() => _isRunning = true);
+    if (result is ServiceRequestSuccess && mounted) {
+      setState(() => _isRunning = true);
+    }
   }
 
   Future<void> _stopService() async {
     await FlutterForegroundTask.stopService();
-    setState(() => _isRunning = false);
+    if (mounted) setState(() => _isRunning = false);
   }
 
   void _send(Map<String, dynamic> data) =>
@@ -101,27 +131,19 @@ class _AudioControlPageState extends State<AudioControlPage> {
                       Icons.power_settings_new,
                       'Start',
                       Colors.green,
-                      _startService,
+                      _requestPermissionsAndStart,
                     )
                   else ...[
                     _btn(Icons.play_arrow, 'Play', Colors.blue, () {
                       _send({'cmd': 'play', 'url': _urlController.text});
                     }),
-                    const SizedBox(width: 16),
-                    _btn(
-                      Icons.pause,
-                      'Pause',
-                      Colors.orange,
-                      () => _send({'cmd': 'pause'}),
-                    ),
-                    const SizedBox(width: 16),
-                    _btn(
-                      Icons.stop,
-                      'Stop',
-                      Colors.red,
-                      () => _send({'cmd': 'stop'}),
-                    ),
-                    const SizedBox(width: 16),
+                    const SizedBox(width: 12),
+                    _btn(Icons.pause, 'Pause', Colors.orange,
+                        () => _send({'cmd': 'pause'})),
+                    const SizedBox(width: 12),
+                    _btn(Icons.stop, 'Stop', Colors.red,
+                        () => _send({'cmd': 'stop'})),
+                    const SizedBox(width: 12),
                     _btn(Icons.power_off, 'Kill', Colors.grey, _stopService),
                   ],
                 ],
@@ -138,11 +160,35 @@ class _AudioControlPageState extends State<AudioControlPage> {
                 ),
               ],
               const SizedBox(height: 12),
-              Text(
-                _isRunning ? '● Running in background' : '○ Service stopped',
-                style: TextStyle(
-                  color: _isRunning ? Colors.greenAccent : Colors.grey,
-                ),
+              Row(
+                mainAxisAlignment: MainAxisAlignment.center,
+                children: [
+                  Icon(
+                    _isRunning ? Icons.circle : Icons.circle_outlined,
+                    size: 12,
+                    color: _isRunning ? Colors.greenAccent : Colors.grey,
+                  ),
+                  const SizedBox(width: 6),
+                  Text(
+                    _isRunning ? 'Running in background' : 'Service stopped',
+                    style: TextStyle(
+                      color: _isRunning ? Colors.greenAccent : Colors.grey,
+                    ),
+                  ),
+                  const SizedBox(width: 16),
+                  Icon(
+                    _permissionsGranted ? Icons.lock_open : Icons.lock,
+                    size: 12,
+                    color: _permissionsGranted ? Colors.greenAccent : Colors.redAccent,
+                  ),
+                  const SizedBox(width: 6),
+                  Text(
+                    _permissionsGranted ? 'Permissions OK' : 'Permissions needed',
+                    style: TextStyle(
+                      color: _permissionsGranted ? Colors.greenAccent : Colors.redAccent,
+                    ),
+                  ),
+                ],
               ),
             ],
           ),
