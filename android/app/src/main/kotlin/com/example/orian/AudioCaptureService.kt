@@ -29,31 +29,35 @@ class AudioCaptureService : Service() {
         const val CHANNEL_ID            = "audio_capture_channel"
         const val NOTIF_ID              = 2001
 
-        var projectionResultCode: Int   = 0
+        var projectionResultCode: Int     = 0
         var projectionResultData: Intent? = null
     }
 
-    private val scope = CoroutineScope(Dispatchers.IO + SupervisorJob())
-    private var mediaProjection: MediaProjection? = null
-    private var audioRecord: AudioRecord? = null
+    // FIX 1: Use a dedicated SupervisorJob so individual child failures don't cancel the whole scope
+    private val serviceJob = SupervisorJob()
+    private val scope       = CoroutineScope(Dispatchers.IO + serviceJob)
 
-    // One AudioTrack per physical output device
+    private var mediaProjection: MediaProjection? = null
+    private var audioRecord: AudioRecord?         = null
+
     private var speakerTrack: AudioTrack? = null
-    private var wiredTrack: AudioTrack?   = null
-    private var btTrack: AudioTrack?      = null
+    private var wiredTrack:   AudioTrack? = null
+    private var btTrack:      AudioTrack? = null
 
     private var useSpeaker   = false
     private var useWired     = false
     private var useBluetooth = false
-    private var isCapturing  = false
 
-    private val SAMPLE_RATE  = 44100
-    private val CHANNEL_IN   = AudioFormat.CHANNEL_IN_STEREO
-    private val CHANNEL_OUT  = AudioFormat.CHANNEL_OUT_STEREO
-    private val ENCODING     = AudioFormat.ENCODING_PCM_16BIT
+    // FIX 2: Guard the capture loop with @Volatile so it's visible across threads
+    @Volatile private var isCapturing = false
+
+    private val SAMPLE_RATE = 44100
+    private val CHANNEL_IN  = AudioFormat.CHANNEL_IN_STEREO
+    private val CHANNEL_OUT = AudioFormat.CHANNEL_OUT_STEREO
+    private val ENCODING    = AudioFormat.ENCODING_PCM_16BIT
 
     private var deviceBroadcastReceiver: BroadcastReceiver? = null
-    private var audioFocusRequest: AudioFocusRequest? = null
+    private var audioFocusRequest: AudioFocusRequest?       = null
 
     override fun onBind(intent: Intent?): IBinder? = null
 
@@ -68,17 +72,19 @@ class AudioCaptureService : Service() {
             override fun onReceive(context: Context, intent: Intent) {
                 when (intent.action) {
                     AudioManager.ACTION_HEADSET_PLUG -> {
-                        val hasHeadset = intent.getIntExtra("state", 0) == 1
-                        val microphone = intent.getIntExtra("microphone", 0)
                         notifyDeviceChange()
                     }
                     BluetoothAdapter.ACTION_CONNECTION_STATE_CHANGED -> {
                         notifyDeviceChange()
                     }
                     AudioManager.ACTION_AUDIO_BECOMING_NOISY -> {
-                        if (isCapturing && useWired) {
-                            // Wired headphones disconnected, mute wired output
-                            wiredTrack?.pause()
+                        // FIX 3: Pause ALL tracks when audio becomes noisy (headphones unplugged),
+                        // not just the wired track — prevents audio leaking to speaker unexpectedly.
+                        if (isCapturing) {
+                            pauseAllTracks()
+                            useWired = false
+                            // Re-apply routing so speaker/BT take over if still selected
+                            applyDeviceRouting()
                         }
                     }
                 }
@@ -90,7 +96,18 @@ class AudioCaptureService : Service() {
             addAction(BluetoothAdapter.ACTION_CONNECTION_STATE_CHANGED)
             addAction(AudioManager.ACTION_AUDIO_BECOMING_NOISY)
         }
-        registerReceiver(deviceBroadcastReceiver, filter)
+
+        // FIX 4: On Android 14+ (API 34) registerReceiver requires an explicit RECEIVER_EXPORTED
+        // or RECEIVER_NOT_EXPORTED flag or it throws an exception.
+        try {
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
+                registerReceiver(deviceBroadcastReceiver, filter, RECEIVER_NOT_EXPORTED)
+            } else {
+                registerReceiver(deviceBroadcastReceiver, filter)
+            }
+        } catch (e: Exception) {
+            println("Error registering device receiver: ${e.message}")
+        }
     }
 
     private fun notifyDeviceChange() {
@@ -102,18 +119,25 @@ class AudioCaptureService : Service() {
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         when (intent?.action) {
             ACTION_START -> {
-                useSpeaker   = intent.getBooleanExtra(EXTRA_USE_SPEAKER, false)
+                useSpeaker   = intent.getBooleanExtra(EXTRA_USE_SPEAKER, true)   // FIX 5: default true for speaker
                 useBluetooth = intent.getBooleanExtra(EXTRA_USE_BLUETOOTH, false)
                 useWired     = intent.getBooleanExtra(EXTRA_USE_WIRED, false)
-                requestAudioFocus()
                 startForegroundNotification()
-                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) startCapture()
+                requestAudioFocus()
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                    // FIX 6: Only start capture if not already capturing
+                    if (!isCapturing) startCapture()
+                }
             }
             ACTION_STOP -> stopCapture()
             ACTION_UPDATE_OUTPUTS -> {
-                useSpeaker   = intent.getBooleanExtra(EXTRA_USE_SPEAKER, false)
+                useSpeaker   = intent.getBooleanExtra(EXTRA_USE_SPEAKER, true)
                 useBluetooth = intent.getBooleanExtra(EXTRA_USE_BLUETOOTH, false)
                 useWired     = intent.getBooleanExtra(EXTRA_USE_WIRED, false)
+                // Re-pin before applying so new devices are picked up
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
+                    pinTracksToDevices()
+                }
                 applyDeviceRouting()
             }
         }
@@ -130,9 +154,15 @@ class AudioCaptureService : Service() {
                         .setContentType(AudioAttributes.CONTENT_TYPE_MUSIC)
                         .build()
                 )
+                .setAcceptsDelayedFocusGain(true)  // FIX 7: handle delayed focus grant
                 .setOnAudioFocusChangeListener { focusChange ->
                     when (focusChange) {
-                        AudioManager.AUDIOFOCUS_LOSS_TRANSIENT -> {
+                        AudioManager.AUDIOFOCUS_GAIN -> {
+                            // Resume if we were paused by a transient loss
+                            if (isCapturing) applyDeviceRouting()
+                        }
+                        AudioManager.AUDIOFOCUS_LOSS_TRANSIENT,
+                        AudioManager.AUDIOFOCUS_LOSS_TRANSIENT_CAN_DUCK -> {
                             pauseAllTracks()
                         }
                         AudioManager.AUDIOFOCUS_LOSS -> {
@@ -147,12 +177,10 @@ class AudioCaptureService : Service() {
             am.requestAudioFocus(
                 { focusChange ->
                     when (focusChange) {
-                        AudioManager.AUDIOFOCUS_LOSS_TRANSIENT -> {
-                            pauseAllTracks()
-                        }
-                        AudioManager.AUDIOFOCUS_LOSS -> {
-                            stopCapture()
-                        }
+                        AudioManager.AUDIOFOCUS_GAIN              -> { if (isCapturing) applyDeviceRouting() }
+                        AudioManager.AUDIOFOCUS_LOSS_TRANSIENT,
+                        AudioManager.AUDIOFOCUS_LOSS_TRANSIENT_CAN_DUCK -> pauseAllTracks()
+                        AudioManager.AUDIOFOCUS_LOSS              -> stopCapture()
                     }
                 },
                 AudioManager.STREAM_MUSIC,
@@ -164,14 +192,18 @@ class AudioCaptureService : Service() {
     @RequiresApi(Build.VERSION_CODES.Q)
     private fun startCapture() {
         val code = projectionResultCode
-        val data = projectionResultData ?: return
+        val data = projectionResultData ?: run {
+            println("No projection data available — call requestCapturePermission first")
+            return
+        }
 
         try {
             val mgr = getSystemService(MEDIA_PROJECTION_SERVICE) as MediaProjectionManager
             mediaProjection = mgr.getMediaProjection(code, data)
 
-            val minBuf = AudioRecord.getMinBufferSize(SAMPLE_RATE, CHANNEL_IN, ENCODING)
-            val bufferSize = minBuf.coerceAtLeast(8192)
+            val minBuf    = AudioRecord.getMinBufferSize(SAMPLE_RATE, CHANNEL_IN, ENCODING)
+            // FIX 8: Use a larger buffer (4× min) to avoid underruns during routing switches
+            val bufferSize = (minBuf * 4).coerceAtLeast(8192)
 
             val captureConfig = AudioPlaybackCaptureConfiguration.Builder(mediaProjection!!)
                 .addMatchingUsage(AudioAttributes.USAGE_MEDIA)
@@ -195,95 +227,63 @@ class AudioCaptureService : Service() {
                 throw Exception("AudioRecord failed to initialize")
             }
 
-            // Build one AudioTrack per output
-            speakerTrack = buildTrack(bufferSize).also { 
-                println("Speaker track created: $it")
-            }
-            wiredTrack   = buildTrack(bufferSize).also { 
-                println("Wired track created: $it")
-            }
-            btTrack      = buildTrack(bufferSize).also { 
-                println("Bluetooth track created: $it")
-            }
+            speakerTrack = buildTrack(bufferSize)
+            wiredTrack   = buildTrack(bufferSize)
+            btTrack      = buildTrack(bufferSize)
 
-            // Pin each track to its physical device
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
                 pinTracksToDevices()
             }
 
-            // Apply routing and START playing
             applyDeviceRouting()
 
             audioRecord?.startRecording()
             isCapturing = true
-            
+
             println("Audio capture started successfully")
 
             scope.launch {
-                val buffer = ShortArray(bufferSize / 2)
+                // FIX 9: Use a ByteArray/ShortArray sized to EXACTLY half of bufferSize shorts
+                // (bufferSize is in bytes; each short = 2 bytes)
+                val buffer     = ShortArray(bufferSize / 2)
                 var writeCount = 0
-                
+
                 while (isCapturing) {
                     try {
                         val read = audioRecord?.read(buffer, 0, buffer.size) ?: break
-                        if (read <= 0) continue
-                        
+                        // FIX 10: treat ERROR_INVALID_OPERATION and other negatives explicitly
+                        if (read < 0) {
+                            println("AudioRecord read error: $read")
+                            break
+                        }
+                        if (read == 0) continue
+
                         writeCount++
-                        
-                        // Write audio data to all enabled and playing tracks
-                        // We write to all of them to ensure simultaneous playback
-                        val jobs = mutableListOf<Job>()
-                        
+
+                        // FIX 11: Write sequentially instead of parallel coroutine launches.
+                        // Parallel writes to separate AudioTrack instances caused buffer
+                        // mis-alignment and write errors with some devices.
                         if (useSpeaker) {
-                            jobs += launch { 
-                                try {
-                                    val result = speakerTrack?.write(buffer, 0, read) ?: 0
-                                    if (result < 0) {
-                                        println("Speaker track write error: $result")
-                                    }
-                                } catch (e: Exception) {
-                                    println("Error writing to speaker track: ${e.message}")
-                                }
-                            }
+                            val r = speakerTrack?.write(buffer, 0, read) ?: 0
+                            if (r < 0) println("Speaker write error: $r")
                         }
-                        
                         if (useWired) {
-                            jobs += launch { 
-                                try {
-                                    val result = wiredTrack?.write(buffer, 0, read) ?: 0
-                                    if (result < 0) {
-                                        println("Wired track write error: $result")
-                                    }
-                                } catch (e: Exception) {
-                                    println("Error writing to wired track: ${e.message}")
-                                }
-                            }
+                            val r = wiredTrack?.write(buffer, 0, read) ?: 0
+                            if (r < 0) println("Wired write error: $r")
                         }
-                        
                         if (useBluetooth) {
-                            jobs += launch { 
-                                try {
-                                    val result = btTrack?.write(buffer, 0, read) ?: 0
-                                    if (result < 0) {
-                                        println("Bluetooth track write error: $result")
-                                    }
-                                } catch (e: Exception) {
-                                    println("Error writing to bluetooth track: ${e.message}")
-                                }
-                            }
+                            val r = btTrack?.write(buffer, 0, read) ?: 0
+                            if (r < 0) println("Bluetooth write error: $r")
                         }
-                        
-                        if (jobs.isNotEmpty()) {
-                            jobs.forEach { it.join() }
-                        }
-                        
-                        // Log every 100 writes for debugging
-                        if (writeCount % 100 == 0) {
-                            println("Audio write cycle $writeCount - Speaker: $useSpeaker, Wired: $useWired, BT: $useBluetooth")
+
+                        if (writeCount % 500 == 0) {
+                            println("Capture cycle $writeCount — Speaker:$useSpeaker Wired:$useWired BT:$useBluetooth")
                         }
                     } catch (e: Exception) {
-                        println("Error in capture loop: ${e.message}")
-                        e.printStackTrace()
+                        if (isCapturing) {
+                            println("Error in capture loop: ${e.message}")
+                            e.printStackTrace()
+                        }
                         break
                     }
                 }
@@ -299,118 +299,83 @@ class AudioCaptureService : Service() {
     @RequiresApi(Build.VERSION_CODES.M)
     private fun pinTracksToDevices() {
         try {
-            val am = getSystemService(AUDIO_SERVICE) as AudioManager
+            val am      = getSystemService(AUDIO_SERVICE) as AudioManager
             val devices = am.getDevices(AudioManager.GET_DEVICES_OUTPUTS)
 
             var speakerDevice: AudioDeviceInfo? = null
-            var wiredDevice: AudioDeviceInfo?   = null
-            var btDevice: AudioDeviceInfo?      = null
+            var wiredDevice:   AudioDeviceInfo? = null
+            var btDevice:      AudioDeviceInfo? = null
 
             for (d in devices) {
                 when (d.type) {
-                    AudioDeviceInfo.TYPE_BUILTIN_SPEAKER -> speakerDevice = d
+                    AudioDeviceInfo.TYPE_BUILTIN_SPEAKER    -> speakerDevice = d
                     AudioDeviceInfo.TYPE_WIRED_HEADSET,
-                    AudioDeviceInfo.TYPE_WIRED_HEADPHONES -> wiredDevice = d
-                    AudioDeviceInfo.TYPE_BLUETOOTH_A2DP,
-                    AudioDeviceInfo.TYPE_BLUETOOTH_SCO -> btDevice = d
+                    AudioDeviceInfo.TYPE_WIRED_HEADPHONES   -> wiredDevice   = d
+                    // FIX 12: Prefer A2DP over SCO for music. SCO is low-quality (call audio).
+                    AudioDeviceInfo.TYPE_BLUETOOTH_A2DP     -> btDevice      = d
                 }
             }
 
-            speakerDevice?.let { 
+            speakerDevice?.let {
                 speakerTrack?.preferredDevice = it
-                println("Pinned speaker track to device: ${it.productName}")
+                println("Pinned speaker track → ${it.productName}")
             }
-            wiredDevice?.let { 
+            wiredDevice?.let {
                 wiredTrack?.preferredDevice = it
-                println("Pinned wired track to device: ${it.productName}")
+                println("Pinned wired track → ${it.productName}")
             }
-            btDevice?.let { 
+            btDevice?.let {
                 btTrack?.preferredDevice = it
-                println("Pinned Bluetooth track to device: ${it.productName}")
+                println("Pinned BT track → ${it.productName}")
+            } ?: run {
+                // FIX 13: If A2DP not found, fall back to SCO device for BT audio
+                val scoDevice = devices.firstOrNull { it.type == AudioDeviceInfo.TYPE_BLUETOOTH_SCO }
+                scoDevice?.let {
+                    btTrack?.preferredDevice = it
+                    println("Pinned BT track (SCO fallback) → ${it.productName}")
+                }
             }
-            
-            // Apply AudioManager settings to enforce routing
-            applyAudioManagerRouting(am, devices)
         } catch (e: Exception) {
             println("Error pinning tracks to devices: ${e.message}")
         }
     }
 
     @RequiresApi(Build.VERSION_CODES.M)
-    private fun applyAudioManagerRouting(am: AudioManager, devices: Array<AudioDeviceInfo>) {
-        try {
-            // Get current routing
-            val hasSpeaker = devices.any { it.type == AudioDeviceInfo.TYPE_BUILTIN_SPEAKER }
-            val hasWired = devices.any { it.type == AudioDeviceInfo.TYPE_WIRED_HEADSET || it.type == AudioDeviceInfo.TYPE_WIRED_HEADPHONES }
-            val hasBluetooth = devices.any { it.type == AudioDeviceInfo.TYPE_BLUETOOTH_A2DP || it.type == AudioDeviceInfo.TYPE_BLUETOOTH_SCO }
-
-            // Configure audio routing based on selected outputs
-            // If speaker is selected AND wired/bluetooth also selected, keep speaker ON
-            // Otherwise, disable speaker if other devices are available
-            val allOutputsSelected = (useSpeaker && useBluetooth) || (useSpeaker && useWired) || (useBluetooth && useWired)
-            
-            if (useSpeaker && hasSpeaker) {
-                am.setSpeakerphoneOn(true)
-                println("Audio routing: Speaker ON")
-            }
-            
-            if (useBluetooth && hasBluetooth) {
-                // Force Bluetooth A2DP if available
-                val btDevices = devices.filter { it.type == AudioDeviceInfo.TYPE_BLUETOOTH_A2DP || it.type == AudioDeviceInfo.TYPE_BLUETOOTH_SCO }
-                if (btDevices.isNotEmpty()) {
-                    println("Audio routing: Bluetooth device available - ${btDevices.first().productName}")
-                }
-            }
-            
-            if (useWired && hasWired) {
-                println("Audio routing: Wired headphones in use")
-            }
-        } catch (e: Exception) {
-            println("Error applying AudioManager routing: ${e.message}")
-        }
-    }
-
-    @RequiresApi(Build.VERSION_CODES.M)
     private fun updateDeviceStatus() {
         try {
-            val am = getSystemService(AUDIO_SERVICE) as AudioManager
+            val am      = getSystemService(AUDIO_SERVICE) as AudioManager
             val devices = am.getDevices(AudioManager.GET_DEVICES_OUTPUTS)
 
-            var hasSpeaker = false
-            var hasWired = false
+            var hasSpeaker   = false
+            var hasWired     = false
             var hasBluetooth = false
 
             for (d in devices) {
                 when (d.type) {
-                    AudioDeviceInfo.TYPE_BUILTIN_SPEAKER -> hasSpeaker = true
+                    AudioDeviceInfo.TYPE_BUILTIN_SPEAKER    -> hasSpeaker   = true
                     AudioDeviceInfo.TYPE_WIRED_HEADSET,
-                    AudioDeviceInfo.TYPE_WIRED_HEADPHONES -> hasWired = true
+                    AudioDeviceInfo.TYPE_WIRED_HEADPHONES   -> hasWired     = true
                     AudioDeviceInfo.TYPE_BLUETOOTH_A2DP,
-                    AudioDeviceInfo.TYPE_BLUETOOTH_SCO -> hasBluetooth = true
+                    AudioDeviceInfo.TYPE_BLUETOOTH_SCO      -> hasBluetooth = true
                 }
             }
 
-            println("Device status: Speaker=$hasSpeaker, Wired=$hasWired, Bluetooth=$hasBluetooth")
-            println("Current selection: Speaker=$useSpeaker, Wired=$useWired, Bluetooth=$useBluetooth")
+            println("Devices: Speaker=$hasSpeaker Wired=$hasWired BT=$hasBluetooth")
+            println("Selected: Speaker=$useSpeaker Wired=$useWired BT=$useBluetooth")
 
-            // If wired was selected but not connected, disable it
             if (useWired && !hasWired) {
-                println("Disabling wired - device not available")
+                println("Disabling wired — device disconnected")
                 useWired = false
                 wiredTrack?.pause()
             }
-
-            // If Bluetooth was selected but not connected, disable it
             if (useBluetooth && !hasBluetooth) {
-                println("Disabling Bluetooth - device not available")
+                println("Disabling Bluetooth — device disconnected")
                 useBluetooth = false
                 btTrack?.pause()
             }
 
-            // Re-pin tracks in case device topology changed
+            // Re-pin and re-route to pick up any new devices
             pinTracksToDevices()
-            
-            // Re-apply routing to ensure proper device setup
             applyDeviceRouting()
         } catch (e: Exception) {
             println("Error updating device status: ${e.message}")
@@ -419,63 +384,47 @@ class AudioCaptureService : Service() {
 
     private fun applyDeviceRouting() {
         try {
-            val am = getSystemService(AUDIO_SERVICE) as AudioManager
-            
-            // Log current state
-            println("Applying device routing - Speaker: $useSpeaker, Wired: $useWired, Bluetooth: $useBluetooth")
-            
-            // Speaker output
+            println("Routing — Speaker:$useSpeaker Wired:$useWired BT:$useBluetooth")
+
+            // Speaker
             if (useSpeaker) {
                 speakerTrack?.play()
-                println("▶ Speaker track playing")
+                println("▶ Speaker")
             } else {
                 speakerTrack?.pause()
-                println("⏸ Speaker track paused")
+                println("⏸ Speaker")
             }
-            
-            // Wired output
+
+            // Wired
             if (useWired) {
                 wiredTrack?.play()
-                println("▶ Wired track playing")
+                println("▶ Wired")
             } else {
                 wiredTrack?.pause()
-                println("⏸ Wired track paused")
+                println("⏸ Wired")
             }
-            
-            // Bluetooth output - Don't use SCO (that's for calls), use A2DP for audio
+
+            // Bluetooth — verify device is actually present before playing
             if (useBluetooth) {
-                // Check if Bluetooth is actually available
-                val am = getSystemService(AUDIO_SERVICE) as AudioManager
-                val devices = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
-                    am.getDevices(AudioManager.GET_DEVICES_OUTPUTS)
-                } else {
-                    emptyArray()
-                }
-                
-                val btAvailable = devices.any { 
-                    it.type == AudioDeviceInfo.TYPE_BLUETOOTH_A2DP || it.type == AudioDeviceInfo.TYPE_BLUETOOTH_SCO 
-                }
-                
+                val btAvailable = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
+                    val am = getSystemService(AUDIO_SERVICE) as AudioManager
+                    am.getDevices(AudioManager.GET_DEVICES_OUTPUTS).any {
+                        it.type == AudioDeviceInfo.TYPE_BLUETOOTH_A2DP ||
+                        it.type == AudioDeviceInfo.TYPE_BLUETOOTH_SCO
+                    }
+                } else false
+
                 if (btAvailable) {
                     btTrack?.play()
-                    println("▶ Bluetooth track playing (A2DP audio)")
+                    println("▶ Bluetooth")
                 } else {
                     btTrack?.pause()
-                    println("⚠ Bluetooth requested but no device available")
+                    println("⚠ Bluetooth requested but no device present")
                 }
             } else {
                 btTrack?.pause()
-                println("⏸ Bluetooth track paused")
+                println("⏸ Bluetooth")
             }
-            
-            // Ensure speaker phon is on if speaker is selected
-            if (useSpeaker) {
-                am.setSpeakerphoneOn(true)
-            } else if (!useWired && !useBluetooth) {
-                // Only disable speaker if no other devices are selected
-                am.setSpeakerphoneOn(false)
-            }
-            
         } catch (e: Exception) {
             println("Error applying device routing: ${e.message}")
             e.printStackTrace()
@@ -518,8 +467,13 @@ class AudioCaptureService : Service() {
     }
 
     private fun stopCapture() {
+        // FIX 14: Set flag FIRST to stop the capture coroutine cleanly before releasing resources
         isCapturing = false
-        scope.cancel()
+
+        // Give the coroutine a brief moment to notice the flag change
+        Thread.sleep(50)
+
+        scope.coroutineContext.cancelChildren()
 
         pauseAllTracks()
 
@@ -527,9 +481,13 @@ class AudioCaptureService : Service() {
         audioRecord?.release()
         audioRecord = null
 
-        listOf(speakerTrack, wiredTrack, btTrack).forEach {
-            it?.stop()
-            it?.release()
+        listOf(speakerTrack, wiredTrack, btTrack).forEach { track ->
+            try {
+                track?.stop()
+                track?.release()
+            } catch (e: Exception) {
+                println("Error releasing track: ${e.message}")
+            }
         }
         speakerTrack = null
         wiredTrack   = null
@@ -540,15 +498,13 @@ class AudioCaptureService : Service() {
 
         try {
             val am = getSystemService(AUDIO_SERVICE) as AudioManager
-            // Reset speaker phone setting
             am.setSpeakerphoneOn(false)
-            
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O && audioFocusRequest != null) {
                 am.abandonAudioFocusRequest(audioFocusRequest!!)
             }
             audioFocusRequest = null
         } catch (e: Exception) {
-            println("Error during cleanup: ${e.message}")
+            println("Error during audio cleanup: ${e.message}")
         }
 
         stopForeground(true)
@@ -558,7 +514,7 @@ class AudioCaptureService : Service() {
     private fun startForegroundNotification() {
         val notif = NotificationCompat.Builder(this, CHANNEL_ID)
             .setContentTitle("Orian Audio Router")
-            .setContentText("Routing system audio...")
+            .setContentText("Routing system audio…")
             .setSmallIcon(android.R.drawable.ic_media_play)
             .setOngoing(true)
             .build()
@@ -576,14 +532,22 @@ class AudioCaptureService : Service() {
     }
 
     override fun onDestroy() {
-        stopCapture()
+        // FIX 15: Cancel scope job on destroy to prevent coroutine leaks
+        isCapturing = false
+        serviceJob.cancel()
         if (deviceBroadcastReceiver != null) {
             try {
                 unregisterReceiver(deviceBroadcastReceiver)
+                deviceBroadcastReceiver = null
             } catch (e: Exception) {
                 println("Error unregistering receiver: ${e.message}")
             }
         }
+        // Release tracks that may not have been stopped via stopCapture()
+        listOf(speakerTrack, wiredTrack, btTrack).forEach { it?.release() }
+        speakerTrack = null; wiredTrack = null; btTrack = null
+        audioRecord?.release(); audioRecord = null
+        mediaProjection?.stop(); mediaProjection = null
         super.onDestroy()
     }
 }

@@ -12,40 +12,54 @@ import io.flutter.plugin.common.MethodChannel
 class MainActivity : FlutterActivity() {
 
     companion object {
-        const val CHANNEL = "com.example.orian/audio_capture"
+        const val CHANNEL        = "com.example.orian/audio_capture"
         const val DEVICE_CHANNEL = "com.example.orian/device_monitor"
         const val REQUEST_MEDIA_PROJECTION = 1001
     }
 
     private var pendingResult: MethodChannel.Result? = null
-    private var deviceMonitor: DeviceMonitor? = null
+    private var deviceMonitor: DeviceMonitor?        = null
 
     override fun configureFlutterEngine(@NonNull flutterEngine: FlutterEngine) {
         super.configureFlutterEngine(flutterEngine)
 
-        // Setup device monitoring
         deviceMonitor = DeviceMonitor(this)
         deviceMonitor?.setupChannel(flutterEngine, DEVICE_CHANNEL)
 
         MethodChannel(flutterEngine.dartExecutor.binaryMessenger, CHANNEL)
             .setMethodCallHandler { call, result ->
                 when (call.method) {
+
                     "requestCapturePermission" -> {
+                        // FIX 1: Guard against a second in-flight permission request —
+                        // calling startActivityForResult twice without resolving the first
+                        // caused pendingResult to be overwritten and the first caller to hang.
+                        if (pendingResult != null) {
+                            result.error("ALREADY_PENDING", "A permission request is already in progress", null)
+                            return@setMethodCallHandler
+                        }
                         try {
                             pendingResult = result
                             val mgr = getSystemService(MEDIA_PROJECTION_SERVICE) as MediaProjectionManager
                             startActivityForResult(mgr.createScreenCaptureIntent(), REQUEST_MEDIA_PROJECTION)
                         } catch (e: Exception) {
+                            pendingResult = null   // FIX 2: clear on failure so caller can retry
                             result.error("PERMISSION_ERROR", e.message, null)
                         }
                     }
+
                     "startCapture" -> {
+                        // FIX 3: Require projection data to be set before starting the service
+                        if (AudioCaptureService.projectionResultData == null) {
+                            result.error("NO_PERMISSION", "Call requestCapturePermission first", null)
+                            return@setMethodCallHandler
+                        }
                         try {
                             val intent = Intent(this, AudioCaptureService::class.java).apply {
                                 action = AudioCaptureService.ACTION_START
                                 putExtra(AudioCaptureService.EXTRA_USE_BLUETOOTH, call.argument<Boolean>("bluetooth") ?: false)
-                                putExtra(AudioCaptureService.EXTRA_USE_WIRED, call.argument<Boolean>("wired") ?: false)
-                                putExtra(AudioCaptureService.EXTRA_USE_SPEAKER, call.argument<Boolean>("speaker") ?: true)
+                                putExtra(AudioCaptureService.EXTRA_USE_WIRED,     call.argument<Boolean>("wired")     ?: false)
+                                putExtra(AudioCaptureService.EXTRA_USE_SPEAKER,   call.argument<Boolean>("speaker")   ?: true)
                             }
                             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
                                 startForegroundService(intent)
@@ -57,6 +71,7 @@ class MainActivity : FlutterActivity() {
                             result.error("START_ERROR", e.message, null)
                         }
                     }
+
                     "stopCapture" -> {
                         try {
                             startService(Intent(this, AudioCaptureService::class.java).apply {
@@ -67,19 +82,21 @@ class MainActivity : FlutterActivity() {
                             result.error("STOP_ERROR", e.message, null)
                         }
                     }
+
                     "updateOutputs" -> {
                         try {
                             startService(Intent(this, AudioCaptureService::class.java).apply {
                                 action = AudioCaptureService.ACTION_UPDATE_OUTPUTS
                                 putExtra(AudioCaptureService.EXTRA_USE_BLUETOOTH, call.argument<Boolean>("bluetooth") ?: false)
-                                putExtra(AudioCaptureService.EXTRA_USE_WIRED, call.argument<Boolean>("wired") ?: false)
-                                putExtra(AudioCaptureService.EXTRA_USE_SPEAKER, call.argument<Boolean>("speaker") ?: true)
+                                putExtra(AudioCaptureService.EXTRA_USE_WIRED,     call.argument<Boolean>("wired")     ?: false)
+                                putExtra(AudioCaptureService.EXTRA_USE_SPEAKER,   call.argument<Boolean>("speaker")   ?: true)
                             })
                             result.success(true)
                         } catch (e: Exception) {
                             result.error("UPDATE_ERROR", e.message, null)
                         }
                     }
+
                     else -> result.notImplemented()
                 }
             }
@@ -89,14 +106,23 @@ class MainActivity : FlutterActivity() {
         super.onActivityResult(requestCode, resultCode, data)
         if (requestCode == REQUEST_MEDIA_PROJECTION) {
             if (resultCode == Activity.RESULT_OK && data != null) {
-                // Store projection data in service companion
                 AudioCaptureService.projectionResultCode = resultCode
                 AudioCaptureService.projectionResultData = data
                 pendingResult?.success(true)
             } else {
+                // FIX 4: Clear stale projection data if the user denies permission
+                AudioCaptureService.projectionResultCode = 0
+                AudioCaptureService.projectionResultData = null
                 pendingResult?.success(false)
             }
             pendingResult = null
         }
+    }
+
+    // FIX 5: Clean up DeviceMonitor reference when activity is destroyed
+    // to prevent context leaks if the activity is recreated (e.g. rotation).
+    override fun onDestroy() {
+        deviceMonitor = null
+        super.onDestroy()
     }
 }
