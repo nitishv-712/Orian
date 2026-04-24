@@ -1,5 +1,5 @@
 import 'package:flutter/services.dart';
-import '../models/audio_device.dart';
+import 'package:orian/models/audio_device.dart';
 
 class AudioCaptureService {
   static const _channel = MethodChannel('com.example.orian/audio_capture');
@@ -8,29 +8,25 @@ class AudioCaptureService {
   );
 
   static bool _isCapturing = false;
-  static List<AudioDevice> _availableDevices = [];
 
-  // Stream for device changes
+  /// Stream of available audio output devices. Emits a new list whenever
+  /// a device is connected or disconnected.
   static Stream<List<AudioDevice>> get onDevicesChanged => _deviceChannel
-      .receiveBroadcastStream('device_changes')
+      .receiveBroadcastStream()
       .map<List<AudioDevice>>((event) {
-        if (event is Map) {
-          _availableDevices = _parseDevices(event);
-          return _availableDevices;
-        }
-        return [];
+        if (event is Map) return _parseDevices(event);
+        return const [];
       })
-      .handleError((error, stackTrace) {
-        print('Device monitor error: $error');
-        return [];
+      .handleError((Object error) {
+        // ignore errors — caller will retain last known state
       });
 
-  static List<AudioDevice> _parseDevices(Map event) {
+  static List<AudioDevice> _parseDevices(Map<dynamic, dynamic> event) {
     final devices = <AudioDevice>[];
 
     if (event['speaker'] == true) {
       devices.add(
-        AudioDevice(
+        const AudioDevice(
           type: AudioDeviceType.speaker,
           name: 'Speaker',
           isConnected: true,
@@ -40,7 +36,7 @@ class AudioCaptureService {
 
     if (event['wired'] == true) {
       devices.add(
-        AudioDevice(
+        const AudioDevice(
           type: AudioDeviceType.wired,
           name: 'Wired Headphones',
           isConnected: true,
@@ -52,7 +48,9 @@ class AudioCaptureService {
       devices.add(
         AudioDevice(
           type: AudioDeviceType.bluetooth,
-          name: event['bluetoothName'] as String? ?? 'Bluetooth Device',
+          name: (event['bluetoothName'] as String?)?.isNotEmpty == true
+              ? event['bluetoothName'] as String
+              : 'Bluetooth Device',
           isConnected: true,
         ),
       );
@@ -63,67 +61,46 @@ class AudioCaptureService {
 
   static Future<bool> requestCapturePermission() async {
     try {
-      final result = await _channel.invokeMethod<bool>(
-        'requestCapturePermission',
-      );
-      return result ?? false;
+      return await _channel.invokeMethod<bool>('requestCapturePermission') ??
+          false;
     } catch (e) {
-      print('Error requesting capture permission: $e');
       return false;
     }
   }
 
-  static Future<bool> startCapture({
-    required bool speaker,
-    required bool bluetooth,
-    required bool wired,
-  }) async {
+  static Future<bool> startCapture({required bool bluetooth}) async {
     try {
-      await _channel.invokeMethod('startCapture', {
-        'speaker': speaker,
+      await _channel.invokeMethod<bool>('startCapture', {
         'bluetooth': bluetooth,
-        'wired': wired,
       });
       _isCapturing = true;
       return true;
     } catch (e) {
-      print('Error starting capture: $e');
       return false;
     }
   }
 
   static Future<bool> stopCapture() async {
     try {
-      await _channel.invokeMethod('stopCapture');
+      await _channel.invokeMethod<bool>('stopCapture');
       _isCapturing = false;
       return true;
     } catch (e) {
-      print('Error stopping capture: $e');
       return false;
     }
   }
 
-  static Future<bool> updateOutputs({
-    required bool speaker,
-    required bool bluetooth,
-    required bool wired,
-  }) async {
+  static Future<bool> updateOutputs({required bool bluetooth}) async {
     if (!_isCapturing) return false;
-
     try {
-      await _channel.invokeMethod('updateOutputs', {
-        'speaker': speaker,
+      await _channel.invokeMethod<bool>('updateOutputs', {
         'bluetooth': bluetooth,
-        'wired': wired,
       });
       return true;
     } catch (e) {
-      print('Error updating outputs: $e');
       return false;
     }
   }
 
   static bool get isCapturing => _isCapturing;
-
-  static List<AudioDevice> get availableDevices => _availableDevices;
 }
